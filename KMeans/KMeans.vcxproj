@@ -151,7 +151,21 @@ copy "$(CudaToolkitBinDir)\cudart*.dll" "$(OutDir)"</Command>
     </CudaCompile>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <CudaCompile Include="kernel.cu" />
+    <CudaCompile Include="main.cpp" />
+    <CudaCompile Include="gpu_kmeans.cu" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="cpu_kmeans.h" />
+    <ClInclude Include="gpu_kmeans.h" />
+    <ClInclude Include="points.h" />
+    <ClInclude Include="points_io.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="cpu_kmeans.cpp" />
+    <ClCompile Include="points_io.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="iris.csv" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
