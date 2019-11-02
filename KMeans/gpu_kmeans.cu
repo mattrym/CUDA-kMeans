@@ -32,7 +32,7 @@ __device__ void init_shared_means(const int k, const float* means, float* s_mean
 	}
 }
 
-__device__ float square_distance(const float* p1, const float* p2)
+__device__ float gpu_square_distance(const float* p1, const float* p2)
 {
 	return (p2[0] - p1[0]) * (p2[0] - p1[0])
 		+ (p2[1] - p1[1]) * (p2[1] - p1[1])
@@ -49,7 +49,7 @@ __device__ void assign_cluster(const int k, const float* point, const float* mea
 
 	for (cluster = 0; cluster < k; ++cluster)
 	{
-		distance = square_distance(point, means + cluster * DIM);
+		distance = gpu_square_distance(point, means + cluster * DIM);
 		if (distance < min_distance)
 		{
 			min_distance = distance;
@@ -285,7 +285,7 @@ __global__ void calculate_means(const int n, const int k, const float* sums, con
 	export_delta(n, blocks, changes, s_changes, delta);
 }
 
-void gpu_kmeans(int n, int k, float max_delta, float* input_points, float* output_means, int* output_assignments)
+void gpu_kmeans(const int n, const int k, const float max_delta, const float* input_points, float* output_means, int* output_assignments)
 {
 	int *counts, *assignments, *changes;
 	float *points, *means, *sums;

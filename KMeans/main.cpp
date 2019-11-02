@@ -3,6 +3,8 @@
 
 #include "points.h"
 #include "points_io.h"
+
+#include "cpu_kmeans.h"
 #include "gpu_kmeans.h"
 
 int main(int argc, char* argv[])
@@ -43,7 +45,7 @@ int main(int argc, char* argv[])
 		exit(1);
 	}
 
-	gpu_kmeans(n, k, 0.0, points, means, asgns);
+	cpu_kmeans(n, k, 0.0, points, means, asgns);
 
 	for (i = 0; i < n; ++i)
 	{
