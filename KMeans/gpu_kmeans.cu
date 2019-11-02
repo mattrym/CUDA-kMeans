@@ -9,7 +9,7 @@
 #include "points.h"
 #include "gpu_kmeans.h"
 
-inline void check_cuda_error(cudaError_t cuda_status, const char* file, int line)
+inline void check_cuda_error(const cudaError_t cuda_status, const char* file, const int line)
 {
 	if (cuda_status != cudaSuccess)
 	{
@@ -19,273 +19,321 @@ inline void check_cuda_error(cudaError_t cuda_status, const char* file, int line
 }
 #define CUDA_SAFE(cuda_status) check_cuda_error(cuda_status, __FILE__, __LINE__)
 
-__device__ void init_shared_centroids(int k, float* s_means, float* g_means)
+__device__ void init_shared_means(const int k, const float* means, float* s_means)
 {
-	int mean_idx;
+	int mean_index;
 
 	if (threadIdx.x < k) {
-		mean_idx = threadIdx.x * DIM;
+		mean_index = threadIdx.x * DIM;
 
-		s_means[mean_idx] = g_means[mean_idx];
-		s_means[mean_idx + 1] = g_means[mean_idx + 1];
-		s_means[mean_idx + 2] = g_means[mean_idx + 2];
+		s_means[mean_index] = means[mean_index];
+		s_means[mean_index + 1] = means[mean_index + 1];
+		s_means[mean_index + 2] = means[mean_index + 2];
 	}
-	__syncthreads();
 }
 
-__device__ float distance(float* p1, float* p2)
+__device__ float square_distance(const float* p1, const float* p2)
 {
 	return (p2[0] - p1[0]) * (p2[0] - p1[0])
 		+ (p2[1] - p1[1]) * (p2[1] - p1[1])
 		+ (p2[2] - p1[2]) * (p2[2] - p1[2]);
 }
 
-__device__ void assign_cluster(int k, float* point, float* means, int* asgns, int* n_asgns)
+__device__ void assign_cluster(const int k, const float* point, const float* means, int* assignments, int* changes)
 {
-	float dist, min_dist;
-	int cluster, min_cluster;
+	float distance, min_distance;
+	int cluster, best_cluster;
 
-	int point_idx = threadIdx.x;
-
-	n_asgns[point_idx] = 0;
-	min_dist = FLT_MAX;
-	min_cluster = -1;
+	min_distance = FLT_MAX;
+	best_cluster = -1;
 
 	for (cluster = 0; cluster < k; ++cluster)
 	{
-		dist = distance(point, means + cluster * DIM);
-		if (dist < min_dist)
+		distance = square_distance(point, means + cluster * DIM);
+		if (distance < min_distance)
 		{
-			min_dist = dist;
-			min_cluster = cluster;
+			min_distance = distance;
+			best_cluster = cluster;
 		}
 	}
 
-	if (min_cluster != asgns[point_idx])
+	changes[threadIdx.x] = 0;
+	if (best_cluster != assignments[threadIdx.x])
 	{
-		n_asgns[point_idx] = 1;
-		asgns[point_idx] = min_cluster;
+		assignments[threadIdx.x] = best_cluster;
+		changes[threadIdx.x] = 1;
 	}
 }
 
-__device__ void reduce_clusters(int k, float* point, int asgn, float* s_sums, int* s_counts, int* s_new_asgns, float* sums, int* counts, int* new_asgns)
+__device__ void reduce_changes(const int window, int* changes)
 {
-	int cluster, cluster_idx;
-	int offset, offset_idx;
+	int offset, last_offset = window;
 
-	const int thread_idx = threadIdx.x;
-
-	for (offset = blockDim.x / 2; offset > 0; offset >>= 1)
+	for (offset = window >> 1; offset > 0; offset >>= 1)
 	{
 		if (threadIdx.x < offset)
 		{
-			s_new_asgns[threadIdx.x] += s_new_asgns[offset + threadIdx.x];
+			changes[threadIdx.x] += changes[offset + threadIdx.x];
 		}
-		__syncthreads();
-	}
-
-	if (!threadIdx.x)
-	{
-		new_asgns[blockIdx.x] = s_new_asgns[0];
-	}
-
-	for (cluster = 0; cluster < k; ++cluster)
-	{
-		s_sums[threadIdx.x * DIM] = cluster == asgn ? point[0] : 0;
-		s_sums[threadIdx.x * DIM + 1] = cluster == asgn ? point[1] : 0;
-		s_sums[threadIdx.x * DIM + 2] = cluster == asgn ? point[2] : 0;
-
-		s_counts[threadIdx.x] = cluster == asgn ? 1 : 0;
-
-		__syncthreads();
-
-		for (offset = blockDim.x / 2; offset > 0; offset >>= 1)
+		if (threadIdx.x == offset && last_offset & 1)
 		{
-			if (threadIdx.x < offset)
-			{
-				offset_idx = offset + threadIdx.x;
-
-				s_sums[threadIdx.x * DIM] += s_sums[offset_idx * DIM];
-				s_sums[threadIdx.x * DIM + 1] += s_sums[offset_idx * DIM + 1];
-				s_sums[threadIdx.x * DIM + 2] += s_sums[offset_idx * DIM + 2];
-
-				s_counts[threadIdx.x] += s_counts[offset + threadIdx.x];
-			}
-			__syncthreads();
+			changes[threadIdx.x] = changes[last_offset - 1];
+			offset += 1;
 		}
 
-		if (!threadIdx.x)
-		{
-			cluster_idx = blockIdx.x * k + cluster;
-
-			sums[cluster_idx * DIM] = s_sums[0];
-			sums[cluster_idx * DIM + 1] = s_sums[1];
-			sums[cluster_idx * DIM + 2] = s_sums[2];
-
-			counts[cluster_idx] = s_counts[0];
-		}
+		last_offset = offset;
 		__syncthreads();
 	}
 }
 
-__global__ void assign_clusters(int n, int k, float* points, float* means, float* sums, int* counts, int* asgns, int* new_asgns)
+__device__ void reduce_cluster_points(const int window, const float* point, const int include, float* sums, int* counts)
+{
+	int offset, last_offset;
+	int offset_index, offset_sum_index;
+
+	const int index = threadIdx.x;
+	const int sum_index = index * DIM;
+
+	sums[sum_index] = include ? point[0] : 0;
+	sums[sum_index + 1] = include ? point[1] : 0;
+	sums[sum_index + 2] = include ? point[2] : 0;
+
+	counts[index] = include ? 1 : 0;
+
+	__syncthreads();
+
+	last_offset = window;
+	for (offset = window >> 1; offset > 0; last_offset = offset, offset >>= 1)
+	{
+		offset_index = offset + index;
+		offset_sum_index = offset_index * DIM;
+
+		if (threadIdx.x < offset)
+		{
+			sums[sum_index] += sums[offset_sum_index];
+			sums[sum_index + 1] += sums[offset_sum_index + 1];
+			sums[sum_index + 2] += sums[offset_sum_index + 2];
+
+			counts[index] += counts[offset_index];
+		}
+		if (threadIdx.x == offset && last_offset & 1)
+		{
+			sums[sum_index] = sums[offset_sum_index];
+			sums[sum_index + 1] = sums[offset_sum_index + 1];
+			sums[sum_index + 2] = sums[offset_sum_index + 2];
+
+			counts[index] = counts[offset_index];
+
+			offset += 1;
+		}
+
+		__syncthreads();
+	}
+}
+
+__device__ void export_cluster_sums(const int k, const int cluster, const float* s_sums, const int* s_counts, float* sums, int* counts)
+{
+	const int cluster_index = blockIdx.x * k + cluster;
+
+	if (threadIdx.x == 0)
+	{
+		sums[cluster_index * DIM] = s_sums[0];
+		sums[cluster_index * DIM + 1] = s_sums[1];
+		sums[cluster_index * DIM + 2] = s_sums[2];
+
+		counts[cluster_index] = s_counts[0];
+	}
+}
+
+__global__ void assign_clusters(const int n, const int k, const float* points, const float* means, float* sums, int* counts, int* assignments, int* changes)
 {
 	extern __shared__ int shared_memory[];
 
-	int point_idx, asgn;
+	int assignment, cluster;
 	float point[DIM];
 
-	int cluster, cluster_idx;
-	int offset, offset_idx;
+	float* s_means = (float*)shared_memory;					// sizeof(float) * k * DIM (for each cluster)
+	float* s_sums = (float*)(s_means + k * DIM);			// sizeof(float) * blockDim.x * DIM (for each point)
+	int* s_counts = (int*)(s_sums + blockDim.x * DIM);		// sizeof(int) * blockDim.x (for each point)
+	int* s_assignments = (int*)(s_counts + blockDim.x);		// sizeof(int) * blockDim.x (for each point)
+	int* s_changes = (int*)(s_assignments + blockDim.x);	// sizeof(int) * blockDim.x (for each point)
 
-	float* s_means = (float*)shared_memory;				// sizeof(float) * k * DIM
-	float* s_sums = (float*)(s_means + k * DIM);			// sizeof(float) * blockDim.x * DIM
-	int* s_asgns = (int*)(s_sums + blockDim.x);			// sizeof(int) * blockDim.x
-	int* s_counts = (int*)(s_asgns + blockDim.x);			// sizeof(int) * blockDim.x
-	int* s_new_asgns = (int*)(s_counts + blockDim.x);		// sizeof(int) * n
+	const int window = (blockIdx.x + 1) * blockDim.x > n ? n % blockDim.x : blockDim.x;
+	const int point_index = blockIdx.x * blockDim.x + threadIdx.x;
 
-	point_idx = blockIdx.x * blockDim.x + threadIdx.x;
-	if (point_idx >= n)
+	if (point_index >= n)
 	{
 		return;
 	}
 
-	point[0] = (points + point_idx * DIM)[0];
-	point[1] = (points + point_idx * DIM)[1];
-	point[2] = (points + point_idx * DIM)[2];
+	point[0] = (points + point_index * DIM)[0];
+	point[1] = (points + point_index * DIM)[1];
+	point[2] = (points + point_index * DIM)[2];
 
-	init_shared_centroids(k, s_means, means);
-	assign_cluster(k, point, s_means, s_asgns, s_new_asgns);
+	init_shared_means(k, means, s_means);
 	__syncthreads();
 
-	asgn = asgns[point_idx] = s_asgns[threadIdx.x];
-	reduce_clusters(k, point, asgn, s_sums, s_counts, s_new_asgns, sums, counts, new_asgns);
-}
-
-__global__ void calculate_means(int n, int k, float* means, float* delta, float* sums, int* counts, int* new_asgns)
-{
-	extern __shared__ int shared_memory[];
-
-	int idx, offset, offset_idx, count;
-	const int blocks = blockDim.x / k;
-
-	float* s_sums = (float*)shared_memory;
-	int* s_counts = (int*)(s_sums + blockDim.x * DIM);
-	int* s_new_asgns = (int*)(s_counts + blockDim.x);
-
-	idx = threadIdx.x * DIM;
-
-	s_sums[idx] = sums[idx];
-	s_sums[idx + 1] = sums[idx + 1];
-	s_sums[idx + 2] = sums[idx + 2];
-
-	s_counts[threadIdx.x] = counts[threadIdx.x];
-	if (threadIdx.x < blocks)
-	{
-		s_new_asgns[threadIdx.x] = new_asgns[threadIdx.x];
-	}
+	assign_cluster(k, point, s_means, s_assignments, s_changes);
+	assignments[point_index] = assignment = s_assignments[threadIdx.x];
 	__syncthreads();
 
-
-	for (offset = blockDim.x / 2; offset >= k; offset >>= 1)
+	for (cluster = 0; cluster < k; ++cluster)
 	{
-		if (threadIdx.x < offset)
-		{
-			offset_idx = (offset + threadIdx.x) * DIM;
-
-			s_sums[idx] += s_sums[offset_idx];
-			s_sums[idx + 1] += s_sums[offset_idx + 1];
-			s_sums[idx + 2] += s_sums[offset_idx + 2];
-
-			s_counts[threadIdx.x] += s_counts[offset + threadIdx.x];
-		}
+		reduce_cluster_points(window, point, assignment == cluster, s_sums, s_counts);
+		export_cluster_sums(k, cluster, s_sums, s_counts, sums, counts);
 		__syncthreads();
 	}
 
-	if (threadIdx.x < blocks)
-	{
-		for (offset = blocks / 2; offset > 0; offset >>= 1)
-		{
-			if (threadIdx.x < offset)
-			{
-				s_new_asgns[threadIdx.x] += s_new_asgns[offset + threadIdx.x];
-			}
-			__syncthreads();
-		}
-	}
-
-	if (threadIdx.x < k)
-	{
-		count = s_counts[threadIdx.x] > 0 ? s_counts[threadIdx.x] : 1;
-
-		means[idx] = s_sums[idx] / count;
-		means[idx + 1] = s_sums[idx + 1] / count;
-		means[idx + 2] = s_sums[idx + 2] / count;
-	}
-
+	reduce_changes(blockDim.x, s_changes);
 	if (threadIdx.x == 0)
 	{
-		*delta = s_new_asgns[0] * 1.0 / n;
+		changes[blockIdx.x] = s_changes[0];
+	}	
+}
+
+__device__ void reduce_means(const int blocks, const int k, const float* sum, const int count, float* sums, int* counts)
+{
+	int offset, last_offset;
+	int offset_index, offset_sum_index;
+
+	const int index = threadIdx.x;
+	const int sum_index = index * DIM;
+
+	sums[sum_index] = sum[0];
+	sums[sum_index + 1] = sum[1];
+	sums[sum_index + 2] = sum[2];
+	counts[index] = count;
+
+	__syncthreads();
+
+	last_offset = blocks;
+	for (offset = blocks >> 1; offset > 0; last_offset = offset, offset >>= 1)
+	{
+		offset_index = offset * k + threadIdx.x;
+		offset_sum_index = offset_index * DIM;
+
+		if (threadIdx.x < offset * k)
+		{
+			sums[sum_index] += sums[offset_sum_index];
+			sums[sum_index + 1] += sums[offset_sum_index + 1];
+			sums[sum_index + 2] += sums[offset_sum_index + 2];
+
+			counts[index] += counts[offset_index];
+		}
+		if (threadIdx.x == offset * k && last_offset & 1)
+		{
+			sums[sum_index] = sums[offset_sum_index];
+			sums[sum_index + 1] = sums[offset_sum_index + 1];
+			sums[sum_index + 2] = sums[offset_sum_index + 2];
+
+			counts[index] = counts[offset_index];
+
+			offset += 1;
+		}
+
+		__syncthreads();
 	}
 }
 
-void kmeans_gpu(int n, int k, float max_delta, float* input_points, float* output_means, int* output_asgns)
+__device__ void export_means(const int k, const float* s_sums, const int* s_counts, float* means)
 {
-	float *points, *means, *sums;
-	int *asgns, *new_asgns, *counts;
-	float *d_delta, h_delta;
+	int count;
+	const int index = threadIdx.x;
+	const int sum_index = index * DIM;
 
-	const int threads = 1024;
+	if (index < k)
+	{
+		count = s_counts[index] > 0 ? s_counts[index] : 1;
+
+		means[sum_index] = s_sums[sum_index] / count;
+		means[sum_index + 1] = s_sums[sum_index + 1] / count;
+		means[sum_index + 2] = s_sums[sum_index + 2] / count;
+	}
+}
+
+__device__ void export_delta(const int n, const int blocks, const int* changes, int* s_changes, float* delta)
+{
+	const int index = threadIdx.x;
+
+	if (index < blocks)
+	{
+		s_changes[index] = changes[index];
+		__syncthreads();
+
+		reduce_changes(blocks, s_changes);
+		if (threadIdx.x == 0)
+		{
+			*delta = s_changes[0] * 1.0 / n;
+		}
+	}
+}
+
+__global__ void calculate_means(const int n, const int k, const float* sums, const int* counts, const int* changes, float* means, float* delta)
+{
+	extern __shared__ int shared_memory[];
+
+	float* s_sums = (float*)shared_memory;
+	int* s_counts = (int*)(s_sums + blockDim.x * DIM);
+	int* s_changes = (int*)(s_counts + blockDim.x);
+
+	const float* sum = sums + threadIdx.x * DIM;
+	const int count = counts[threadIdx.x];
+	const int blocks = blockDim.x / k;
+
+	reduce_means(blocks, k, sum, count, s_sums, s_counts);
+	export_means(k, s_sums, s_counts, means);
+	export_delta(n, blocks, changes, s_changes, delta);
+}
+
+void gpu_kmeans(int n, int k, float max_delta, float* input_points, float* output_means, int* output_assignments)
+{
+	int *counts, *assignments, *changes;
+	float *points, *means, *sums;
+	float *device_delta, host_delta;
+
+	const int threads = THREADS_PER_BLOCK;
 	const int blocks = (n + threads - 1) / threads;
 
-	const int ac_mem_size =
-		k * DIM * sizeof(float) +
-		threads * DIM * sizeof(float) +
-		threads * sizeof(int) +
-		threads * sizeof(int) +
-		blocks * sizeof(int);
-	const int cm_mem_size =
-		blocks * k * DIM * sizeof(float) +
-		blocks * k * sizeof(int) +
-		blocks * sizeof(int);
+	const int ac_mem_size = (k * DIM) * sizeof(float) + (threads * DIM) * sizeof(float) + (3 * threads) * sizeof(int);
+	const int cm_mem_size = (blocks * k * DIM) * sizeof(float) + (blocks * k) * sizeof(int) + blocks * sizeof(int);
 
 	CUDA_SAFE(cudaSetDevice(0));
 
 	CUDA_SAFE(cudaMalloc((void**)&points, n * DIM * sizeof(float)));
 	CUDA_SAFE(cudaMalloc((void**)&means, k * DIM * sizeof(float)));
-	CUDA_SAFE(cudaMalloc((void**)&asgns, n * sizeof(int)));
+	CUDA_SAFE(cudaMalloc((void**)&assignments, n * sizeof(int)));
 
 	CUDA_SAFE(cudaMalloc((void**)&sums, blocks * k * DIM * sizeof(float)));
 	CUDA_SAFE(cudaMalloc((void**)&counts, blocks * k * sizeof(int)));
-	CUDA_SAFE(cudaMalloc((void**)&new_asgns, blocks * sizeof(int)));
+	CUDA_SAFE(cudaMalloc((void**)&changes, blocks * sizeof(int)));
 
-	CUDA_SAFE(cudaMalloc((void**)&d_delta, sizeof(float)));
+	CUDA_SAFE(cudaMalloc((void**)&device_delta, sizeof(float)));
 
 	CUDA_SAFE(cudaMemcpy(points, input_points, n * DIM * sizeof(float), cudaMemcpyHostToDevice));
 	CUDA_SAFE(cudaMemcpy(means, input_points, k * DIM * sizeof(float), cudaMemcpyHostToDevice));
 
-	h_delta = 1;
-	while (h_delta > max_delta)
+	host_delta = 1;
+	while (host_delta > max_delta)
 	{
-		assign_clusters <<<blocks, threads, ac_mem_size>> >(n, k, points, means, sums, counts, asgns, new_asgns);
+		assign_clusters<<<blocks, threads, ac_mem_size>>>(n, k, points, means, sums, counts, assignments, changes);
 		CUDA_SAFE(cudaDeviceSynchronize());
 
-		calculate_means <<<1, blocks * k, cm_mem_size>>>(n, k, means, d_delta, sums, counts, new_asgns);
+		calculate_means<<<1, blocks * k, cm_mem_size>>>(n, k, sums, counts, changes, means, device_delta);
 		CUDA_SAFE(cudaDeviceSynchronize());
 
-		CUDA_SAFE(cudaMemcpy(&h_delta, d_delta, sizeof(float), cudaMemcpyDeviceToHost));
+		CUDA_SAFE(cudaMemcpy(&host_delta, device_delta, sizeof(float), cudaMemcpyDeviceToHost));
 	}
 
 	CUDA_SAFE(cudaMemcpy(output_means, means, k * DIM * sizeof(float), cudaMemcpyDeviceToHost));
-	CUDA_SAFE(cudaMemcpy(output_asgns, asgns, n * sizeof(int), cudaMemcpyDeviceToHost));
+	CUDA_SAFE(cudaMemcpy(output_assignments, assignments, n * sizeof(int), cudaMemcpyDeviceToHost));
 
 	cudaFree(points);
 	cudaFree(means);
-	cudaFree(asgns);
+	cudaFree(assignments);
 
 	cudaFree(sums);
 	cudaFree(counts);
-	cudaFree(new_asgns);
+	cudaFree(changes);
 
 	CUDA_SAFE(cudaDeviceReset());
 }

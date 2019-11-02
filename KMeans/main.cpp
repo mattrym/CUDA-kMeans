@@ -43,7 +43,7 @@ int main(int argc, char* argv[])
 		exit(1);
 	}
 
-	kmeans_gpu(n, k, 0.0, points, means, asgns);
+	gpu_kmeans(n, k, 0.0, points, means, asgns);
 
 	for (i = 0; i < n; ++i)
 	{
