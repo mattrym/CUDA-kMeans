@@ -11,20 +11,29 @@ int main(int argc, char* argv[])
 {
 	char* filename;
 	
-	int i, n;
+	int i, n, k;
+	float max_delta;
+
 	float* points;
 	float* means;
 	int* asgns;
 
-	const int k = 3;
-
-	if (argc != 2)
+	if (argc != 4)
 	{
-		fprintf(stderr, "Usage: %s FILENAME\n", argv[0]);
+		fprintf(stderr, "Usage: %s FILENAME K MAX_DELTA\n", argv[0]);
 		exit(EXIT_FAILURE);
 	}
+	
 	filename = argv[1];
+	k = atoi(argv[2]);
+	max_delta = atof(argv[3]);
 
+	if (k < 2)
+	{
+		fprintf(stderr, "k value should be higher than one");
+		exit(EXIT_FAILURE);
+	}
+	
 	if (load_points(filename, &points, &n))
 	{
 		fprintf(stderr, "Error while processing file (invalid format): %s\n", filename);
@@ -45,11 +54,16 @@ int main(int argc, char* argv[])
 		exit(1);
 	}
 
-	cpu_kmeans(n, k, 0.0, points, means, asgns);
-
-	for (i = 0; i < n; ++i)
+	cpu_kmeans(n, k, max_delta, points, means, asgns);
+	for (i = 0; i < k; ++i)
 	{
-		printf("%.4f %.4f %.4f %d\n", (points + i * DIM)[0], (points + i * DIM)[1], (points + i * DIM)[2], asgns[i]);
+		printf("c[%d]: %.4f %.4f %.4f\n", i, means[i * DIM], means[i * DIM + 1], means[i * DIM + 2]);
+	}
+
+	gpu_kmeans(n, k, max_delta, points, means, asgns);
+	for (i = 0; i < k; ++i)
+	{
+		printf("c[%d]: %.4f %.4f %.4f\n", i, means[i * DIM], means[i * DIM + 1], means[i * DIM + 2]);
 	}
 
 	free(points);

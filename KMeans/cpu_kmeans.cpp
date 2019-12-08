@@ -1,6 +1,8 @@
 #include <stdlib.h>
+#include <stdio.h>
 #include <float.h>
 #include <string.h>
+#include <windows.h>
 
 #include "points.h"
 #include "cpu_kmeans.h"
@@ -71,14 +73,22 @@ void recalculate_means(const int k, float* cluster_sums, int* cluster_size, floa
 void cpu_kmeans(int n, int k, float max_delta, float* points, float* means, int* assignments)
 {
 	int point_index, best_cluster, delta = n;
+	int i, it = 0;
+
+	LARGE_INTEGER freq, start, end;
+	double elapsed_time;
 
 	float* cluster_sums = (float*)calloc(k * DIM, sizeof(float));
 	int* cluster_size = (int*)calloc(k, sizeof(int));
+
+	QueryPerformanceFrequency(&freq);
+	QueryPerformanceCounter(&start);
 
 	initialize_means(k, points, means);
 	
 	while (delta > max_delta * n)
 	{
+		it++;
 		delta = 0;
 		for (point_index = 0; point_index < n; ++point_index)
 		{
@@ -98,6 +108,11 @@ void cpu_kmeans(int n, int k, float max_delta, float* points, float* means, int*
 		memset(cluster_sums, 0, k * DIM * sizeof(float));
 		memset(cluster_size, 0, k * sizeof(int));
 	}
+
+	QueryPerformanceCounter(&end);
+
+	elapsed_time = (end.QuadPart - start.QuadPart) * 1000.0 / freq.QuadPart;
+	printf("\nCPU time: %.7g ms \t CPU iterations: %d\n", elapsed_time, it);
 
 	free(cluster_sums);
 	free(cluster_size);
