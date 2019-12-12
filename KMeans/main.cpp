@@ -26,7 +26,7 @@ int main(int argc, char* argv[])
 	
 	filename = argv[1];
 	k = atoi(argv[2]);
-	max_delta = atof(argv[3]);
+	max_delta = (float) atof(argv[3]);
 
 	if (k < 2)
 	{
